@@ -1,0 +1,213 @@
+services:
+  # --- FRONTEND (REACT) ---
+  web:
+    build: ./frontend
+    expose:
+      - "3000"
+    depends_on:
+      - api
+    # --- HARDENING DI SICUREZZA ---
+    security_opt:
+      - no-new-privileges:true  # Blocca elevazione privilegi
+    cap_drop:
+      - ALL                     # Rimuove superpoteri kernel
+    environment:
+      - CHOKIDAR_USEPOLLING=true
+      - WATCHPACK_POLLING=true
+    networks:
+      - network-backend
+    deploy:
+      resources:
+        limits:
+          cpus: '0.50'      # Massimo 50% di un core
+          memory: 512M     # Massimo 512MB di RAM
+
+
+      
+  # --- BACKEND (NODE API) ---
+  api:
+    build: ./backend
+    expose:
+      - "3001"
+    depends_on:
+      - mongo
+      - vault
+    # --- MODIFICA SC-5: SCALING & LOAD BALANCING ---
+    deploy:
+      replicas: 3  # Crea 3 copie del container per assorbire attacchi DoS
+      resources:
+        limits:
+          cpus: '0.50'     # 50% di un core per ogni replica
+          memory: 512M    # 512MB per ogni replica
+    security_opt:
+      - no-new-privileges:true  # Impedisce Privilege Escalation (binari SUID)
+    cap_drop:
+      - ALL                     # Rimuove i superpoteri del kernel (già presente, ottimo)
+    environment:
+      - VAULT_ADDR=http://vault:8200
+      - VAULT_TOKEN=${VAULT_ROOT_TOKEN}
+    networks:
+      - network-backend
+    volumes:
+      - ./backend:/app
+      - /app/node_modules
+
+  
+  # --- DATABASE APP (MONGO) ---
+  mongo:
+    image: mongo:8.0
+    restart: always
+    security_opt:   # 2. HARDENING DEL RUNTIME (Pilastro: Least Privilege)
+      - no-new-privileges:true  # Blocca l'escalation dei privilegi
+    cap_drop:
+      - ALL
+    cap_add:            # 4. Ridiamo SOLO quelli strettamente necessari al DB per funzionare
+      - CHOWN           # Per cambiare proprietario ai file db
+      - SETUID          # Per cambiare utente interno
+      - SETGID          # Per cambiare gruppo interno
+      - DAC_OVERRIDE    # FONDAMENTALE: Ignora i permessi di lettura/scrittura del kernel (serve allo script di init)
+      - FOWNER          # FONDAMENTALE: Permette di toccare file di cui non si è ancora proprietari
+    environment: 
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_ROOT_USER}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_ROOT_PASS}
+    command: [   
+      "--auth",
+      "--tlsMode", "requireTLS",
+      "--tlsCertificateKeyFile", "/etc/ssl/mongodb.pem",
+      "--tlsCAFile", "/etc/ssl/mongodb.pem",
+      "--tlsAllowConnectionsWithoutCertificates"
+    ]
+    volumes: 
+      - mongodb_data:/data/db
+      - ./mongodb-certs/mongodb.pem:/etc/ssl/mongodb.pem:ro
+    networks: 
+      - network-backend
+    deploy:
+      resources:
+        limits:
+          cpus: '0.50'
+          memory: 512M
+
+
+  # --- REVERSE PROXY (APACHE) ---
+  apache:
+    build: ./apache
+    container_name: apache_secure
+    ports:
+      - "80:8080"     # HTTP
+      - "443:8443"   # HTTPS
+    depends_on:
+      - web
+      - api
+      - keycloak
+    # --- HARDENING DI SICUREZZA ---
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    networks:
+      - network-backend
+    deploy:
+      resources:
+        limits:
+          cpus: '0.50'
+          memory: 256M
+
+
+  vault:
+    build: ./vault
+    container_name: vault
+    ports:
+      - "8200:8200"
+    environment:
+      VAULT_ADDR: 'http://0.0.0.0:8200'
+    # --- HARDENING DI SICUREZZA ---
+    security_opt:
+      - no-new-privileges:true  # Impedisce ai processi di ottenere nuovi privilegi
+    cap_drop:
+      - ALL                     # Rimuove tutti i permessi Linux non necessari
+    cap_add:
+      - IPC_LOCK                # FONDAMENTALE: Permette di bloccare la RAM per non scrivere segreti su disco
+    volumes:
+      - ./vault/config:/vault/config
+      - vault_data:/vault/file
+      - vault_logs:/vault/logs
+    networks:
+      - network-backend
+    deploy:
+      resources:
+        limits:
+          cpus: '0.25'
+          memory: 256M
+      
+  # --- DATABASE PER KEYCLOAK (POSTGRES) ---
+  postgres_keycloak:
+    image: postgres:15-alpine
+    container_name: postgres_keycloak
+    restart: always
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN           # Necessario per cambiare proprietario ai file in /var/lib/postgresql/data
+      - SETUID          # Necessario per passare da root all'utente 'postgres'
+      - SETGID          # Necessario per gestire i gruppi
+      - DAC_OVERRIDE    # FONDAMENTALE: Permette di leggere/scrivere ignorando i permessi stretti del kernel
+      - FOWNER          # FONDAMENTALE: Permette di gestire file montati dall'host
+    environment:
+      POSTGRES_DB: keycloak
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASS}
+    volumes:
+      - ./keycloak_data:/var/lib/postgresql/data
+    networks:
+      - network-backend
+    deploy:
+      resources:
+        limits:
+          cpus: '0.50'
+          memory: 512M
+    
+
+  # --- KEYCLOAK ---
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.4.7
+    container_name: keycloak
+    command: start-dev
+    security_opt:
+      - no-new-privileges:true  # Impedisce ai processi Java di elevare i privilegi
+    cap_drop:
+      - ALL                     # Rimuove tutti i permessi del kernel (Keycloak non ne ha bisogno)
+    depends_on:
+      - postgres_keycloak
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: ${KC_ADMIN}
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KC_ADMIN_PASS}
+      KC_DB: postgres
+      KC_DB_URL: jdbc:postgresql://postgres_keycloak:5432/keycloak
+      KC_DB_USERNAME: keycloak
+      KC_DB_PASSWORD: ${POSTGRES_PASS}
+      KC_HTTP_RELATIVE_PATH: /auth
+      KC_PROXY_HEADERS: xforwarded
+      KC_HOSTNAME_STRICT: "false"
+      KC_HOSTNAME_STRICT_BACKCHANNEL: "false"
+      KC_HTTP_ENABLED: "true"
+      KC_CONTENT_SECURITY_POLICY: "frame-src 'self'; frame-ancestors 'self'; object-src 'none';"
+      KC_HOSTNAME: https://localhost/auth
+      KC_HOSTNAME_ADMIN_URL: https://localhost/auth
+    networks:
+      - network-backend
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1.5G
+
+networks:
+  network-backend:
+
+volumes: 
+  mongodb_data:
+  vault_data:
+  vault_logs:
